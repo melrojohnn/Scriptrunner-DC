@@ -1,0 +1,153 @@
+import com.atlassian.jira.component.ComponentAccessor
+import com.atlassian.jira.security.login.LoginManager
+import com.atlassian.jira.user.ApplicationUser
+import com.atlassian.jira.user.util.UserManager
+import com.atlassian.jira.bc.user.UserService
+import groovy.xml.MarkupBuilder
+import java.util.Calendar
+import java.util.Date
+import javax.mail.internet.MimeBodyPart
+import javax.mail.internet.MimeMultipart
+import com.atlassian.mail.Email
+import java.text.SimpleDateFormat
+
+// Configuration
+final def subject = 'Usuários que não fizeram login na última hora'
+final def emailAddr = 'johnnes.melro@gmail.com'
+final def location = 'America/Sao_Paulo'
+
+// Get user manager and login manager
+def loginManager = ComponentAccessor.getComponent(LoginManager)
+def userManager = ComponentAccessor.userManager
+def userService = ComponentAccessor.getComponent(UserService)
+def groupManager = ComponentAccessor.groupManager
+
+def adminGroup = groupManager.getUsersInGroup('jira-administrators')
+def softwareGroup = groupManager.getUsersInGroup('jira-software-users')
+def serviceDeskGroup = groupManager.getUsersInGroup('jira-servicedesk-users')
+
+def users = adminGroup + softwareGroup + serviceDeskGroup
+users.unique()
+
+// Get all users with their creation dates
+def userCreationDates = [:]
+def allUsers = ComponentAccessor.getOfBizDelegator().findAll("User")
+allUsers.each { user ->
+    userCreationDates[user.getString("userName")] = user.getTimestamp("createdDate")
+}
+
+// Get the current time and calculate the time for 3 days and 2 hours ago
+def now = Calendar.instance
+def threeDaysAgo = now.clone()
+threeDaysAgo.add(Calendar.DAY_OF_YEAR, -3)
+
+def twoHoursAgo = now.clone()
+twoHoursAgo.add(Calendar.HOUR, -2)
+
+// Find inactive users
+def inactiveUsers = users.findAll { user ->
+    def lastLogin = loginManager.getLoginInfo(user.username)?.lastLoginTime
+    def createdDate = userCreationDates[user.username]
+
+    if (lastLogin == null && createdDate != null && createdDate.after(threeDaysAgo.time)) {
+        return false
+    }
+
+    println("Checking user: ${user.username}, Last login: ${lastLogin}, Created: ${createdDate}")
+    (!lastLogin || new Date(lastLogin).before(twoHoursAgo.time)) && user.active
+}
+
+// Log number of inactive users found
+println("Number of inactive users found: ${inactiveUsers.size()}")
+
+// Date formatter for DD/MM/YYYY HH:mm:ss
+def dateFormatter = new SimpleDateFormat("dd/MM/yyyy HH:mm:ss")
+
+// Deactivate inactive users and log the details
+def emailBody = new StringWriter()
+def html = new MarkupBuilder(emailBody)
+
+html.html {
+    head {
+        style(type: 'text/css', """
+            table {
+              border-collapse: collapse;
+              width: 100%;
+            }
+            th, td {
+              text-align: left;
+              padding: 8px;
+            }
+            tr:nth-child(even) { background-color: #f2f2f2 }
+            th {
+              background-color: #04AA6D;
+              color: white;
+            }
+        """)
+    }
+    body {
+        if (inactiveUsers.isEmpty()) {
+            p('Olá, tudo bem? Não há usuários para desativar no momento. Na próxima semana, trarei mais informações sobre os usuários.')
+        } else {
+            p('Olá, tudo bem? Segue a lista de usuários desativados:')
+            table {
+                thead {
+                    tr {
+                        th 'Nome'
+                        th 'ID do Usuário'
+                        th 'E-mail'
+                        th 'Data de Criação'
+                        th 'Último Login'
+                        th 'Status da Conta'
+                    }
+                }
+                tbody {
+                    inactiveUsers.each { user ->
+                        def createdDateFormatted = userCreationDates[user.username] ? dateFormatter.format(userCreationDates[user.username]) : "Data não disponível"
+                        def lastLoginTimeFormatted = loginManager.getLoginInfo(user.username)?.lastLoginTime ? dateFormatter.format(new Date(loginManager.getLoginInfo(user.username).lastLoginTime)) : 'Nunca Logado'
+                        println("User: ${user.displayName}, Created: ${createdDateFormatted}, Last login: ${lastLoginTimeFormatted}")
+
+                        def updateUser = userService.newUserBuilder(user).active(false).build()
+                        def updateUserValidationResult = userService.validateUpdateUser(updateUser)
+
+                        if (updateUserValidationResult.isValid()) {
+                            userService.updateUser(updateUserValidationResult)
+                            tr {
+                                td(user.displayName)
+                                td(user.username)
+                                td(user.emailAddress)
+                                td(createdDateFormatted)
+                                td(lastLoginTimeFormatted)
+                                td('Inativo')
+                            }
+                            println("User deactivated: ${user.username}")
+                        } else {
+                            println("Failed to deactivate user: ${user.username}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Send email with inactive users in the body
+sendEmail(emailAddr, subject, emailBody.toString())
+
+// Send Email
+final static sendEmail(String to, String subject, String content) {
+    def mailServerManager = ComponentAccessor.mailServerManager
+    def mailServer = mailServerManager.defaultSMTPMailServer
+
+    def email = new Email(to)
+    email.setSubject(subject)
+    email.setBody(content)
+    email.setMimeType("text/html")
+
+    def threadClassLoader = Thread.currentThread().contextClassLoader
+    Thread.currentThread().contextClassLoader = mailServer.class.classLoader
+    mailServer.send(email)
+    Thread.currentThread().contextClassLoader = threadClassLoader
+
+    println("Email sent to ${to}")
+}
